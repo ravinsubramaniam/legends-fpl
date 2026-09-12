@@ -6,7 +6,7 @@ on:
     # the gameweek's first kickoff), so the job can't be pinned to a fixed hour.
     # It just keeps the page and the calendar feed current, and the page says
     # what is due next.
-    - cron: "0 */3 * * *"
+    - cron: "0 * * * *"
   workflow_dispatch:        # the "Run workflow" button, for testing
 
 permissions:
