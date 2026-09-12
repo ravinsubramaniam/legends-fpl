@@ -1,0 +1,44 @@
+name: Build FPL post
+
+on:
+  schedule:
+    # Every 3 hours. The post time moves with the fixture list (6 hours before
+    # the gameweek's first kickoff), so the job can't be pinned to a fixed hour.
+    # It just keeps the page and the calendar feed current, and the page says
+    # what is due next.
+    - cron: "0 */3 * * *"
+  workflow_dispatch:        # the "Run workflow" button, for testing
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fpl-post
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Generate the post
+        env:
+          FPL_LEAGUE_ID: "220903"
+          FPL_LEAGUE_NICK: "Legends"
+        run: python fpl_post.py --all
+
+      - name: Publish
+        run: |
+          git config user.name  "fpl-bot"
+          git config user.email "fpl-bot@users.noreply.github.com"
+          git add docs/
+          git diff --staged --quiet && echo "nothing changed" && exit 0
+          git commit -m "post: $(date -u +'%Y-%m-%d %H:%M')"
+          git push
