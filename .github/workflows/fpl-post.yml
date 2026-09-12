@@ -2,10 +2,9 @@ name: Build FPL post
 
 on:
   schedule:
-    # Every 3 hours. The post time moves with the fixture list (6 hours before
-    # the gameweek's first kickoff), so the job can't be pinned to a fixed hour.
-    # It just keeps the page and the calendar feed current, and the page says
-    # what is due next.
+    # Hourly. The post time moves with the fixture list, so the job can't be
+    # pinned to the slots themselves - it just keeps the page fresh enough
+    # that the flags and price watch are current whenever you open it.
     - cron: "0 * * * *"
   workflow_dispatch:        # the "Run workflow" button, for testing
 
