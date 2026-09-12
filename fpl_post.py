@@ -640,7 +640,11 @@ def main() -> int:
 
     due, upcoming = current_slot(d)
     if a.all:
-        posts = {k: f(d) for k, f in BUILDERS.items()}
+        # Whatever is due (or due next) goes on top - that is the one you came
+        # to send. The rest sit below in case you want a different format.
+        lead = (due or upcoming or {}).get("kind")
+        order = ([lead] if lead in BUILDERS else []) + [k for k in BUILDERS if k != lead]
+        posts = {k: BUILDERS[k](d) for k in order}
     else:
         kind = a.type or (due or upcoming or {"kind": "radar"})["kind"]
         posts = {kind: BUILDERS[kind](d)}
