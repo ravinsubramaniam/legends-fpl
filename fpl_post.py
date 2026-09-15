@@ -855,15 +855,23 @@ def main() -> int:
             for s in ([due] if due and due["kind"] == k else
                       [x for x in cal if x["kind"] == k and x["at"] > datetime.now(TZ)][:1])}
 
-    # Safety net. Scores are provisional until FPL locks the gameweek at 9am UK
-    # the day after its last match, so never let a recap go out before then.
+    # Safety net on the recap. Two things make scores provisional: a match still
+    # to finish, or lockdown not reached. FPL's own data_checked flag is NOT
+    # used: it has been observed sitting false for hours after every fixture
+    # finished and the standings had already updated, which would block a post
+    # that was perfectly safe to send.
     hold = None
     cur = d["current"]
     lead = (due or upcoming or {}).get("kind")
-    if cur and not cur.get("data_checked") and lead in ("recap", "combo"):
+    if cur and lead in ("recap", "combo"):
+        fx = [f for f in d["all_fixtures"] if f.get("event") == cur["id"]]
+        left = [f for f in fx if not f.get("finished")]
         bounds = gw_bounds(d["all_fixtures"]).get(cur["id"])
-        if bounds:
-            lock = lockdown_at(bounds[1])
+        lock = lockdown_at(bounds[1]) if bounds else None
+        if left:
+            hold = (f"{cur['name']} is not done: {len(left)} of {len(fx)} "
+                    f"matches still to finish.")
+        elif lock and datetime.now(TZ) < lock:
             hold = (f"{cur['name']} scores are still provisional. "
                     f"FPL locks them at 9am UK, {clock(lock)} here.")
 
