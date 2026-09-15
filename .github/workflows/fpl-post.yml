@@ -2,10 +2,15 @@ name: Build FPL post
 
 on:
   schedule:
-    # Hourly. The post time moves with the fixture list, so the job can't be
-    # pinned to the slots themselves - it just keeps the page fresh enough
-    # that the flags and price watch are current whenever you open it.
-    - cron: "0 * * * *"
+    # Times are UTC. Shaped around when posts actually go out rather than
+    # hammering the scheduler round the clock: ~19 runs a day instead of 48,
+    # with no slot ever seeing a page more than 30 minutes old.
+    - cron: "0,30 8-13 * * *"   # FPL locks gameweeks at 9am UK (08:00 or 09:00
+                                # UTC), so poll every 30 min across that window
+                                # and the late posting slots
+    - cron: "0 4-7,14 * * *"    # hourly over the earlier posting slots
+    - cron: "0 18,22 * * *"     # overnight ticks: keeps the page warm and the
+                                # workflow clear of GitHub's 60 day idle cutoff
   workflow_dispatch:        # the "Run workflow" button, for testing
 
 permissions:
