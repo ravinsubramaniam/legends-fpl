@@ -9,8 +9,9 @@ on:
                                 # UTC), so poll every 30 min across that window
                                 # and the late posting slots
     - cron: "0 4-7,14 * * *"    # hourly over the earlier posting slots
-    - cron: "0 18,22 * * *"     # overnight ticks: keeps the page warm and the
-                                # workflow clear of GitHub's 60 day idle cutoff
+    # Nothing outside 04:00-14:30 UTC, which is the 12pm-10.30pm MYT posting
+    # window. No post can go out then, so a build would be wasted work. The
+    # daily commits still count as activity for GitHub's 60 day idle cutoff.
   workflow_dispatch:        # the "Run workflow" button, for testing
 
 permissions:
