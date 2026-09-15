@@ -27,6 +27,7 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -39,6 +40,7 @@ LEAGUE_ID = int(os.environ.get("FPL_LEAGUE_ID", "220903"))
 LEAGUE_NICK = os.environ.get("FPL_LEAGUE_NICK", "Legends")
 TZ = timezone(timedelta(hours=8))          # Asia/Kuala_Lumpur
 TABLE_ROWS = 5                             # how many league rows in each post
+MOVERS = 2                                 # climbers and fallers named in the recap
 FLAG_MIN_OWNERSHIP = 3.0                   # ignore flags on players nobody owns
 PRICE_NAMES = 4                            # names per rise/fall line
 
@@ -373,7 +375,7 @@ def block_table(d: dict, rows: int = TABLE_ROWS) -> list[str]:
     return out
 
 
-def block_recap_league(d: dict) -> list[str]:
+def block_recap_league(d: dict, facts: dict | None = None) -> list[str]:
     res = d["league"]["standings"]["results"]
     if not res:
         return []
@@ -383,24 +385,25 @@ def block_recap_league(d: dict) -> list[str]:
         (r["entry_name"], (r["last_rank"] or r["rank"]) - r["rank"], r["last_rank"], r["rank"])
         for r in res
     ]
-    up = sorted(moves, key=lambda m: -m[1])[:3]
-    down = sorted(moves, key=lambda m: m[1])[:3]
+    up = sorted(moves, key=lambda m: -m[1])[:MOVERS]
+    down = sorted(moves, key=lambda m: m[1])[:MOVERS]
     gw = d["current"]
+    hi, lo = season_marks(facts, gw["id"] if gw else 0)
     out = [
-        f"👑 Raja minggu ni: *{by_gw[0]['entry_name']}* - {by_gw[0]['event_total']} pts",
+        f"👑 Raja minggu ni: *{by_gw[0]['entry_name']}* - {by_gw[0]['event_total']} pts{hi}",
         f"🥈 {by_gw[1]['entry_name']} - {by_gw[1]['event_total']}",
         f"🥉 {by_gw[2]['entry_name']} - {by_gw[2]['event_total']}",
         "",
         f"Average league: {avg:.1f}" + (f"  |  global: {gw['average_entry_score']}" if gw else ""),
-        "",
-        "📈 *Naik laju*",
     ]
+    out += block_highlights(facts, avg)
+    out += ["", "📈 *Naik laju*"]
     out += [f"{n} +{d_} ({lr} ➜ {r})" for n, d_, lr, r in up if d_ > 0] or ["Takde sesiapa naik. Semua stuck."]
     out += ["", "📉 *Terjun*"]
     out += [f"{n} {d_} ({lr} ➜ {r})" for n, d_, lr, r in down if d_ < 0] or ["Takde sesiapa jatuh."]
     out += [
         "",
-        f"🪦 Wooden spoon minggu ni: *{by_gw[-1]['entry_name']}* - {by_gw[-1]['event_total']}",
+        f"🪦 Wooden spoon minggu ni: *{by_gw[-1]['entry_name']}* - {by_gw[-1]['event_total']}{lo}",
     ]
     return out
 
@@ -415,6 +418,213 @@ def block_poll(d: dict) -> list[str]:
     )[:3]
     names = ", ".join(p["web_name"] for p in picks)
     return ["", f"©️ Captain sapa? {names}, atau punting sendiri? 👇"]
+
+
+# ----------------------------------------------------------------------------
+# Highlights
+#
+# The fixed part of the recap says who won and who moved. This part says what
+# actually HAPPENED: a wasted triple captain, a transfer that cost 15 points,
+# a bench nobody will live down. Each detector has a threshold so it only fires
+# when the thing is genuinely notable, and only the best few make the post.
+# Nothing is padded to fill space.
+#
+# It needs three calls per manager plus the live feed, so the result for a
+# finished gameweek is cached under docs/cache/ and never fetched twice.
+# ----------------------------------------------------------------------------
+MAX_HIGHLIGHTS = 3         # lines in the story section, however much happened
+TC_FLOP = 6                # triple captain raw points at or below this is a flop
+TC_BANG = 12               # and at or above this is a haul
+BB_FLOP, BB_BANG = 8, 20   # bench boost points added
+SWING_BAD, SWING_GOOD = -10, 10   # transfer in minus transfer out
+BENCH_PAIN = 15            # points left on the bench
+FETCH_WORKERS = 8          # parallel requests when building the cache
+
+
+def _cache_path(gw: int) -> Path:
+    return OUT / "cache" / f"gw{gw}.json"
+
+
+def gw_facts(d: dict, gw: int, final: bool, fetch: bool = True) -> dict | None:
+    """Per manager detail for one gameweek. Reading the cache is free, so that
+    is always tried; the 80-odd calls behind it only happen when a recap is the
+    post actually coming up."""
+    p = _cache_path(gw)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    if not fetch:
+        return None
+
+    res = d["league"]["standings"]["results"]
+    if not res:
+        return None
+    names = {e["id"]: e["web_name"] for e in d["bs"]["elements"]}
+    live = {e["id"]: e["stats"]["total_points"]
+            for e in get(f"/event/{gw}/live/")["elements"]}
+
+    def one(r: dict) -> dict:
+        eid = r["entry"]
+        picks = get(f"/entry/{eid}/event/{gw}/picks/")
+        hist = get(f"/entry/{eid}/history/")["current"]
+        moves = [t for t in get(f"/entry/{eid}/transfers/") if t["event"] == gw]
+        cap = next((x for x in picks["picks"] if x["multiplier"] >= 2), None)
+        rows = [h for h in hist if h["points"] is not None]
+        best = max(rows, key=lambda h: h["points"]) if rows else None
+        worst = min(rows, key=lambda h: h["points"]) if rows else None
+        prev = next((h["points"] for h in hist if h["event"] == gw - 1), None)
+        return {
+            "name": r["entry_name"],
+            "pts": r["event_total"],
+            "chip": picks.get("active_chip"),
+            "bench": picks["entry_history"]["points_on_bench"],
+            "hit": picks["entry_history"]["event_transfers_cost"],
+            "cap": names.get(cap["element"]) if cap else None,
+            "cap_pts": live.get(cap["element"], 0) if cap else 0,
+            "cap_mult": cap["multiplier"] if cap else 1,
+            "prev": prev,
+            "best": [best["points"], best["event"]] if best else None,
+            "worst": [worst["points"], worst["event"]] if worst else None,
+            "moves": [{"in": names.get(t["element_in"], "?"),
+                       "ip": live.get(t["element_in"], 0),
+                       "out": names.get(t["element_out"], "?"),
+                       "op": live.get(t["element_out"], 0)} for t in moves],
+        }
+
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        managers = list(pool.map(one, res))
+
+    facts = {"gw": gw, "managers": managers}
+    if final:                       # provisional data must never be cached
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(facts, ensure_ascii=False), encoding="utf-8")
+    return facts
+
+
+# --- detectors: each returns (priority, subject, line) or None ---------------
+def _turnaround(m, gw, avg):
+    prev = [x for x in m if x["prev"] is not None]
+    if len(prev) < 3:
+        return None
+    bottom = min(x["prev"] for x in prev)
+    top = max(x["pts"] for x in m)
+    who = next((x for x in prev if x["prev"] == bottom and x["pts"] == top), None)
+    if who:
+        return (100, who["name"],
+                f"🔄 {who['name']} wooden spoon minggu lepas ({bottom}), raja minggu ni ({top}).")
+    return None
+
+
+def _chips(m, gw, avg):
+    tc = [x for x in m if x["chip"] == "3xc"]
+    bb = [x for x in m if x["chip"] == "bboost"]
+    flops = [x for x in tc if x["cap_pts"] <= TC_FLOP]
+    if len(flops) >= 2:
+        who = ", ".join(x["name"] for x in flops)
+        return (88, None, f"🃏 {len(flops)} orang TC {flops[0]['cap']}. "
+                          f"{flops[0]['cap_pts']} mata sahaja. {who}.")
+    if flops:
+        x = flops[0]
+        return (85, x["name"], f"🃏 {x['name']} TC {x['cap']} dapat {x['cap_pts']}. Aduh.")
+    bangs = [x for x in tc if x["cap_pts"] >= TC_BANG]
+    if bangs:
+        x = max(bangs, key=lambda y: y["cap_pts"])
+        return (85, x["name"],
+                f"🃏 {x['name']} TC {x['cap']} - {x['cap_pts']} x3 = {x['cap_pts'] * 3}. Power.")
+    if bb:
+        x = max(bb, key=lambda y: y["bench"])
+        if x["bench"] >= BB_BANG:
+            return (85, x["name"], f"🃏 Bench Boost {x['name']} tambah {x['bench']} mata.")
+        if x["bench"] <= BB_FLOP:
+            return (84, x["name"], f"🃏 Bench Boost {x['name']} tambah {x['bench']} mata je. Membazir.")
+    return None
+
+
+def _transfers(m, gw, avg, good: bool):
+    swings = [(x["name"], mv["ip"] - mv["op"], mv) for x in m for mv in x["moves"]]
+    if not swings:
+        return None
+    pick = max(swings, key=lambda s: s[1]) if good else min(swings, key=lambda s: s[1])
+    name, sw, mv = pick
+    if good and sw >= SWING_GOOD:
+        return (60, name, f"🎯 {name} buang {mv['out']} ({mv['op']}) ambil "
+                          f"{mv['in']} ({mv['ip']}). +{sw}.")
+    if not good and sw <= SWING_BAD:
+        return (80, name, f"😭 {name} jual {mv['out']} ({mv['op']}) beli "
+                          f"{mv['in']} ({mv['ip']}). {sw}.")
+    return None
+
+
+def _captain_split(m, gw, avg):
+    tally: dict[str, list] = {}
+    for x in m:
+        if x["cap"]:
+            t = tally.setdefault(x["cap"], [0, x["cap_pts"]])
+            t[0] += 1
+    if len(tally) < 2:
+        return None
+    crowd = max(tally.items(), key=lambda kv: kv[1][0])
+    rest = [kv for kv in tally.items() if kv[0] != crowd[0] and kv[1][0] >= 3]
+    if not rest or crowd[1][1] >= 6:
+        return None
+    alt = max(rest, key=lambda kv: kv[1][1])
+    if alt[1][1] < crowd[1][1] * 2:
+        return None
+    return (70, None, f"©️ {crowd[1][0]} orang captain {crowd[0]} ({crowd[1][1]}). "
+                      f"{alt[1][0]} orang {alt[0]} ({alt[1][1]}). Tau tau je.")
+
+
+def _bench(m, gw, avg):
+    x = max(m, key=lambda y: y["bench"])
+    if x["bench"] < BENCH_PAIN or x["chip"] == "bboost":
+        return None
+    return (65, x["name"], f"🪑 {x['name']} tinggal {x['bench']} mata atas bangku.")
+
+
+def _hit(m, gw, avg):
+    bad = [x for x in m if x["hit"] > 0 and x["pts"] < avg]
+    if not bad:
+        return None
+    x = min(bad, key=lambda y: y["pts"])
+    return (55, x["name"], f"💸 {x['name']} ambil -{x['hit']} hit, dapat {x['pts']} je.")
+
+
+def block_highlights(facts: dict | None, avg: float) -> list[str]:
+    """The best few things that happened, worst news first."""
+    if not facts or not facts.get("managers"):
+        return []
+    m, gw = facts["managers"], facts["gw"]
+    found = [
+        _turnaround(m, gw, avg), _chips(m, gw, avg),
+        _transfers(m, gw, avg, good=False), _captain_split(m, gw, avg),
+        _bench(m, gw, avg), _transfers(m, gw, avg, good=True), _hit(m, gw, avg),
+    ]
+    found = sorted((f for f in found if f), key=lambda f: -f[0])
+
+    lines, used = [], set()
+    for _, subject, text in found:
+        if subject and subject in used:      # never two lines about one manager
+            continue
+        if subject:
+            used.add(subject)
+        lines.append(text)
+        if len(lines) == MAX_HIGHLIGHTS:
+            break
+    return ["", "🔥 *Cerita minggu ni*"] + lines if lines else []
+
+
+def season_marks(facts: dict | None, gw: int) -> tuple[str, str]:
+    """Suffixes for the Raja and wooden spoon lines when a record was set."""
+    if not facts or not facts.get("managers"):
+        return "", ""
+    m = facts["managers"]
+    highs = [x["best"] for x in m if x["best"]]
+    lows = [x["worst"] for x in m if x["worst"]]
+    hi = "  (rekod baru musim ni)" if highs and max(highs)[1] == gw else ""
+    lo = "  (paling teruk musim ni)" if lows and min(lows)[1] == gw else ""
+    return hi, lo
 
 
 # ----------------------------------------------------------------------------
@@ -457,8 +667,8 @@ def block_next_deadline(d: dict) -> list[str]:
 def post_recap(d: dict) -> str:
     gw = d["current"]["name"] if d["current"] else "Last GW"
     lines = [f"📊 *{gw.upper()} DAMAGE REPORT*", ""]
-    lines += block_recap_league(d)
-    lines += block_table(d, rows=8)
+    lines += block_recap_league(d, d.get("facts"))
+    lines += block_table(d)
     lines += block_next_deadline(d)
     return "\n".join(lines)
 
@@ -874,6 +1084,14 @@ def main() -> int:
         elif lock and datetime.now(TZ) < lock:
             hold = (f"{cur['name']} scores are still provisional. "
                     f"FPL locks them at 9am UK, {clock(lock)} here.")
+
+    d["facts"] = None
+    if cur:
+        want = lead in ("recap", "combo") and not hold
+        d["facts"] = gw_facts(d, cur["id"], final=not hold, fetch=want)
+        if d["facts"]:                       # rebuild now that the detail is in
+            for k in posts:
+                posts[k] = BUILDERS[k](d)
 
     path = write_page(posts, due, upcoming, dues, hold)
     write_ics(cal)
