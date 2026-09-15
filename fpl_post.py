@@ -48,14 +48,13 @@ PRICE_NAMES = 4                            # names per rise/fall line
 POST_LEAD_HOURS = 6        # post this long before the gameweek's own first match
 WINDOW_START = (12, 0)     # nothing before 12pm MYT
 WINDOW_END = (22, 30)      # nothing after 10.30pm MYT
-RECAP_WEEKDAY = 1          # Tuesday (Mon=0)
-RECAP_HOUR = 15            # 3pm MYT
 UK = ZoneInfo("Europe/London")
 LOCKDOWN_HOUR_UK = 9       # FPL scores go final at 9am UK the day after the last match
-POST_LOCKDOWN_H = 1        # breathing room after lockdown before quoting scores
+POST_LOCKDOWN_H = 0.5      # breathing room after lockdown before quoting scores
 MERGE_WINDOW_H = 36        # a recap this close to a last call becomes one post
 RECAP_STALE_DAYS = 5       # older than this and last week's scores aren't news
 MAX_PER_WINDOW = 2         # hard cap on posts in any CAP_WINDOW_DAYS stretch
+DROUGHT_DAYS = 7           # a gap this long ahead overrides the cap
 CAP_WINDOW_DAYS = 6        # 6 not 7: a Tue recap and the previous Tue recap sit
                            # almost exactly 7 days apart, so a 7 day window counts
                            # last week's post and wrongly drops this week's
@@ -166,16 +165,15 @@ def lockdown_at(last_ko: datetime) -> datetime:
 
 
 def recap_at(last_ko: datetime) -> datetime:
-    """Tuesday 3pm, or as soon after lockdown as the rules allow."""
-    ready = lockdown_at(last_ko) + timedelta(hours=POST_LOCKDOWN_H)
-    day = at_time(ready, (RECAP_HOUR, 0))
-    if day < ready:                       # lockdown lands after the usual slot
-        day = ready
-    while day.weekday() != RECAP_WEEKDAY:
-        day = at_time(day + timedelta(days=1), (RECAP_HOUR, 0))
-    if (day.hour, day.minute) > WINDOW_END:
-        day = at_time(day, WINDOW_END)
-    return day
+    """The day the gameweek concludes, shortly after lockdown. No fixed weekday:
+    a Sunday finish recaps on Monday, a Monday finish on Tuesday. The scores are
+    freshest then, and waiting for a set day only makes them staler."""
+    t = lockdown_at(last_ko) + timedelta(hours=POST_LOCKDOWN_H)
+    if (t.hour, t.minute) < WINDOW_START:
+        t = at_time(t, WINDOW_START)
+    elif (t.hour, t.minute) > WINDOW_END:
+        t = at_time(t, WINDOW_END)
+    return t
 
 
 def fresh(recap: dict, host: dict) -> bool:
@@ -235,6 +233,13 @@ def plan(d: dict) -> list[dict]:
         if s["kind"] == "recap" and len(window) >= MAX_PER_WINDOW:
             nxt = next((x for x in merged
                         if x["kind"] in ("lastcall", "combo") and x["at"] > s["at"]), None)
+            # Keep it anyway if nothing else is coming for a while. Dropping the
+            # recap that sits just before an international break would leave the
+            # group silent for a fortnight, which is the opposite of the point.
+            if (nxt and nxt["at"] - s["at"] > timedelta(days=DROUGHT_DAYS)
+                    and len(window) < MAX_PER_WINDOW + 1):
+                kept.append(s)
+                continue
             if nxt and "recap_gw" not in nxt and fresh(s, nxt):
                 nxt["kind"] = "combo"
                 nxt["recap_gw"] = s["gw"]
