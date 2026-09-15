@@ -28,6 +28,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -49,10 +50,15 @@ WINDOW_START = (12, 0)     # nothing before 12pm MYT
 WINDOW_END = (22, 30)      # nothing after 10.30pm MYT
 RECAP_WEEKDAY = 1          # Tuesday (Mon=0)
 RECAP_HOUR = 15            # 3pm MYT
-SETTLE_HOURS = 8           # after the last kickoff before scores are safe to quote
+UK = ZoneInfo("Europe/London")
+LOCKDOWN_HOUR_UK = 9       # FPL scores go final at 9am UK the day after the last match
+POST_LOCKDOWN_H = 1        # breathing room after lockdown before quoting scores
 MERGE_WINDOW_H = 36        # a recap this close to a last call becomes one post
 RECAP_STALE_DAYS = 5       # older than this and last week's scores aren't news
-MAX_PER_7_DAYS = 2         # hard cap, whatever the fixture list does
+MAX_PER_WINDOW = 2         # hard cap on posts in any CAP_WINDOW_DAYS stretch
+CAP_WINDOW_DAYS = 6        # 6 not 7: a Tue recap and the previous Tue recap sit
+                           # almost exactly 7 days apart, so a 7 day window counts
+                           # last week's post and wrongly drops this week's
 DUE_WINDOW_H = 3           # how long a slot stays flagged as "post this now"
 
 API = "https://fantasy.premierleague.com/api"
@@ -149,14 +155,26 @@ def lastcall_at(first_ko: datetime, deadline: datetime) -> datetime:
     return t
 
 
+def lockdown_at(last_ko: datetime) -> datetime:
+    """When FPL scores go final: 9am UK on the day after the gameweek's last
+    match. New for 2026/27, replacing the old one hour after the final whistle.
+    It matters here because a Monday night kickoff pushes lockdown to Tuesday
+    morning UK, which is Tuesday afternoon in Malaysia, after the usual slot."""
+    uk = last_ko.astimezone(UK) + timedelta(days=1)
+    uk = uk.replace(hour=LOCKDOWN_HOUR_UK, minute=0, second=0, microsecond=0)
+    return uk.astimezone(TZ)
+
+
 def recap_at(last_ko: datetime) -> datetime:
-    """First Tuesday 3pm once the scores have settled."""
-    t = last_ko + timedelta(hours=SETTLE_HOURS)
-    day = t.replace(hour=RECAP_HOUR, minute=0, second=0, microsecond=0)
-    if day < t:
-        day += timedelta(days=1)
+    """Tuesday 3pm, or as soon after lockdown as the rules allow."""
+    ready = lockdown_at(last_ko) + timedelta(hours=POST_LOCKDOWN_H)
+    day = at_time(ready, (RECAP_HOUR, 0))
+    if day < ready:                       # lockdown lands after the usual slot
+        day = ready
     while day.weekday() != RECAP_WEEKDAY:
-        day += timedelta(days=1)
+        day = at_time(day + timedelta(days=1), (RECAP_HOUR, 0))
+    if (day.hour, day.minute) > WINDOW_END:
+        day = at_time(day, WINDOW_END)
     return day
 
 
@@ -213,8 +231,8 @@ def plan(d: dict) -> list[dict]:
     # recaps give way, and they ride along with the next post when they do.
     kept: list[dict] = []
     for s in merged:
-        window = [k for k in kept if s["at"] - k["at"] < timedelta(days=7)]
-        if s["kind"] == "recap" and len(window) >= MAX_PER_7_DAYS:
+        window = [k for k in kept if s["at"] - k["at"] < timedelta(days=CAP_WINDOW_DAYS)]
+        if s["kind"] == "recap" and len(window) >= MAX_PER_WINDOW:
             nxt = next((x for x in merged
                         if x["kind"] in ("lastcall", "combo") and x["at"] > s["at"]), None)
             if nxt and "recap_gw" not in nxt and fresh(s, nxt):
@@ -492,6 +510,7 @@ h1{{font-size:17px;margin:0 0 2px;letter-spacing:-.01em}}
 .banner{{border-radius:12px;padding:12px 14px;margin-bottom:18px;font-size:14px;
  border:1px solid var(--line);background:var(--card)}}
 .banner.now{{background:var(--acc);color:#052e16;border-color:transparent;font-weight:600}}
+.banner.hold{{background:#8a5412;color:#ffeeda;border-color:transparent}}
 .banner b{{font-weight:700}}
 .due{{font-size:12px;color:var(--dim);margin:-6px 0 10px}}
 .card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin-bottom:16px}}
@@ -552,11 +571,13 @@ def when(dt: datetime) -> str:
 
 
 def write_page(posts: dict[str, str], due: dict | None, upcoming: dict | None,
-               dues: dict[str, datetime] | None = None) -> Path:
+               dues: dict[str, datetime] | None = None, hold: str | None = None) -> Path:
     OUT.mkdir(parents=True, exist_ok=True)
     dues = dues or {}
 
-    if due:
+    if hold:
+        banner = f'<div class="banner hold">Hold off &mdash; {hold}</div>'
+    elif due:
         banner = (f'<div class="banner now">Post this now &mdash; '
                   f'{LABELS.get(due["kind"], due["kind"])} was due {clock(due["at"])}.</div>')
     elif upcoming:
@@ -828,7 +849,20 @@ def main() -> int:
     dues = {k: s["at"] for k in posts
             for s in ([due] if due and due["kind"] == k else
                       [x for x in cal if x["kind"] == k and x["at"] > datetime.now(TZ)][:1])}
-    path = write_page(posts, due, upcoming, dues)
+
+    # Safety net. Scores are provisional until FPL locks the gameweek at 9am UK
+    # the day after its last match, so never let a recap go out before then.
+    hold = None
+    cur = d["current"]
+    lead = (due or upcoming or {}).get("kind")
+    if cur and not cur.get("data_checked") and lead in ("recap", "combo"):
+        bounds = gw_bounds(d["all_fixtures"]).get(cur["id"])
+        if bounds:
+            lock = lockdown_at(bounds[1])
+            hold = (f"{cur['name']} scores are still provisional. "
+                    f"FPL locks them at 9am UK, {clock(lock)} here.")
+
+    path = write_page(posts, due, upcoming, dues, hold)
     write_ics(cal)
     write_pwa()
     for k, v in posts.items():
