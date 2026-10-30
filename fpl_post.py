@@ -424,25 +424,558 @@ def block_poll(d: dict) -> list[str]:
 # Highlights
 #
 # The fixed part of the recap says who won and who moved. This part says what
-# actually HAPPENED: a wasted triple captain, a transfer that cost 15 points,
-# a bench nobody will live down. Each detector has a threshold so it only fires
-# when the thing is genuinely notable, and only the best few make the post.
-# Nothing is padded to fill space.
+# actually HAPPENED. Three things keep it from sounding the same every week:
 #
-# It needs three calls per manager plus the live feed, so the result for a
-# finished gameweek is cached under docs/cache/ and never fetched twice.
+#   * thresholds are RELATIVE. A 16 point bench is only a story if it is high
+#     for this league, judged against every bench seen this season, not against
+#     a fixed number that 27 managers clear every single week by chance.
+#   * a detector that ran recently is PENALISED, hard if it ran last week, so
+#     the same three never take all three slots two weeks running.
+#   * each detector has six phrasings, chosen from the gameweek number, so the
+#     wording moves even when the fact repeats.
+#
+# Half the detectors read only the cached season history, so a week where the
+# per manager fetch is skipped still gets a story section instead of nothing.
 # ----------------------------------------------------------------------------
 MAX_HIGHLIGHTS = 3         # lines in the story section, however much happened
 TC_FLOP = 6                # triple captain raw points at or below this is a flop
 TC_BANG = 12               # and at or above this is a haul
 BB_FLOP, BB_BANG = 8, 20   # bench boost points added
-SWING_BAD, SWING_GOOD = -10, 10   # transfer in minus transfer out
-BENCH_PAIN = 15            # points left on the bench
+SWING_BAD, SWING_GOOD = -10, 10   # floors under the relative transfer bars
+BENCH_PAIN = 15            # floor under the relative bench bar
+RECENT_PENALTY = (45, 22, 10)     # points off for firing 1, 2, 3 weeks ago
+MIN_SCORE = 45             # below this a line is dropped rather than padding
 FETCH_WORKERS = 8          # parallel requests when building the cache
 
 
 def _cache_path(gw: int) -> Path:
     return OUT / "cache" / f"gw{gw}.json"
+
+
+def _fired_path() -> Path:
+    return OUT / "cache" / "fired.json"
+
+
+def _bar(pool: list, p: float, floor: int, low: bool = False) -> float:
+    """Relative threshold: the p-th percentile of what this league actually
+    produces, but never weaker than the floor."""
+    if not pool:
+        return floor
+    v = sorted(pool)
+    cut = v[min(len(v) - 1, int(len(v) * p))]
+    return min(cut, floor) if low else max(cut, floor)
+
+
+def _streaks(hist: dict, below: bool) -> list:
+    """[(name, run length)] for managers above or below the league average,
+    longest first. A missing gameweek breaks the run: with GW6 absent from the
+    cache, GW5 and GW7 are not "berturut" and must not be reported as such."""
+    gws = sorted(hist)
+    if not gws:
+        return []
+    runs: dict[str, int] = {}
+    alive = {x["name"] for x in hist[gws[-1]]}
+    expect = gws[-1]
+    for gw in reversed(gws):
+        if gw != expect or not alive:
+            break
+        rows = hist[gw]
+        avg = sum(x["pts"] for x in rows) / len(rows)
+        for x in rows:
+            if x["name"] not in alive:
+                continue
+            if (x["pts"] < avg) if below else (x["pts"] > avg):
+                runs[x["name"]] = runs.get(x["name"], 0) + 1
+            else:
+                alive.discard(x["name"])
+        expect -= 1
+    return sorted(runs.items(), key=lambda kv: -kv[1])
+
+
+def _history(gw: int) -> dict:
+    """Every cached gameweek up to and including this one, {gw: [managers]}."""
+    out = {}
+    folder = OUT / "cache"
+    if not folder.exists():
+        return out
+    for p in folder.glob("gw*.json"):
+        try:
+            n = int(p.stem[2:])
+        except ValueError:
+            continue
+        if n <= gw:
+            try:
+                out[n] = json.loads(p.read_text(encoding="utf-8"))["managers"]
+            except Exception:
+                pass
+    return out
+
+
+def block_highlights(facts: dict | None, avg: float) -> list[str]:
+    """The best few things that happened, after novelty and recency."""
+    if not facts or not facts.get("managers"):
+        return []
+    cur, gw = facts["managers"], facts["gw"]
+    hist = _history(gw)
+    hist[gw] = cur
+
+    stats = {
+        "avg": avg,
+        "benches": [x["bench"] for rows in hist.values() for x in rows
+                    if x["chip"] != "bboost"],
+        "swings": [mv["ip"] - mv["op"] for rows in hist.values()
+                   for x in rows for mv in x["moves"]],
+        "scores": [x["pts"] for rows in hist.values() for x in rows],
+    }
+
+    try:
+        fired = json.loads(_fired_path().read_text(encoding="utf-8"))
+    except Exception:
+        fired = {}
+
+    scored = []
+    for key, fn, base, family in DETECTORS:
+        try:
+            hit = fn(cur, {k: v for k, v in hist.items() if k < gw}, stats)
+        except Exception:
+            hit = None
+        if not hit:
+            continue
+        score = base
+        for back, penalty in enumerate(RECENT_PENALTY, start=1):
+            if key in fired.get(str(gw - back), []):
+                score -= penalty
+        if score >= MIN_SCORE:         # a stale repeat is worse than a short post
+            scored.append((score, key, hit, family))
+    scored.sort(key=lambda t: -t[0])
+
+    lines, used, seen_family, chosen = [], set(), set(), []
+    for _, key, hit, family in scored:
+        subject = hit.get("subject")
+        if subject and subject in used:          # one line per manager
+            continue
+        if family in seen_family:                # one line per kind of point
+            continue
+        name = key
+        if key == "bench_boost" and not hit.get("good", True):
+            name = "bench_boost_bad"
+        elif key == "chip_flop" and hit.get("n") == 1:
+            name = "chip_flop_solo"
+        bank = PHRASES.get(name, [])
+        if not bank:
+            continue
+        try:
+            text = bank[(gw * 7 + len(key)) % len(bank)].format(**hit)
+        except (KeyError, IndexError):
+            continue
+        if subject:
+            used.add(subject)
+        seen_family.add(family)
+        lines.append(text)
+        chosen.append(key)
+        if len(lines) == MAX_HIGHLIGHTS:
+            break
+
+    if chosen:                                   # remember, for next week
+        fired[str(gw)] = chosen
+        try:
+            _fired_path().parent.mkdir(parents=True, exist_ok=True)
+            _fired_path().write_text(json.dumps(fired), encoding="utf-8")
+        except Exception:
+            pass
+    return ["", "🔥 *Cerita minggu ni*"] + lines if lines else []
+
+
+def season_marks(facts: dict | None, gw: int) -> tuple[str, str]:
+    """Suffixes for the Raja and wooden spoon lines when a record was set."""
+    if not facts or not facts.get("managers"):
+        return "", ""
+    m = facts["managers"]
+    highs = [x["best"] for x in m if x["best"]]
+    lows = [x["worst"] for x in m if x["worst"]]
+    hi = "  (rekod baru musim ni)" if highs and max(highs)[1] == gw else ""
+    lo = "  (paling teruk musim ni)" if lows and min(lows)[1] == gw else ""
+    return hi, lo
+
+
+# --- detectors ---------------------------------------------------------------
+# Each returns a dict of fields for its phrasings, or None. "subject" names the
+# manager the line is about, so the same person is never called out twice.
+
+def _d_turnaround(c, h, s):
+    prev = [x for x in c if x["prev"] is not None]
+    if len(prev) < 3:
+        return None
+    low, high = min(x["prev"] for x in prev), max(x["pts"] for x in c)
+    who = next((x for x in prev if x["prev"] == low and x["pts"] == high), None)
+    return {"subject": who["name"], "name": who["name"], "a": low, "b": high} if who else None
+
+
+def _d_chip_flop(c, h, s):
+    tc = [x for x in c if x["chip"] == "3xc" and x["cap_pts"] <= TC_FLOP]
+    if len(tc) >= 2:
+        return {"subject": None, "n": len(tc), "who": ", ".join(x["name"] for x in tc),
+                "name": tc[0]["name"], "player": tc[0]["cap"], "pts": tc[0]["cap_pts"]}
+    if tc:
+        x = tc[0]
+        return {"subject": x["name"], "n": 1, "who": x["name"], "name": x["name"],
+                "player": x["cap"], "pts": x["cap_pts"]}
+    return None
+
+
+def _d_chip_bang(c, h, s):
+    tc = [x for x in c if x["chip"] == "3xc" and x["cap_pts"] >= TC_BANG]
+    if not tc:
+        return None
+    x = max(tc, key=lambda y: y["cap_pts"])
+    return {"subject": x["name"], "name": x["name"], "player": x["cap"],
+            "pts": x["cap_pts"], "total": x["cap_pts"] * 3}
+
+
+def _d_bench_boost(c, h, s):
+    bb = [x for x in c if x["chip"] == "bboost"]
+    if not bb:
+        return None
+    x = max(bb, key=lambda y: y["bench"])
+    if x["bench"] >= BB_BANG:
+        return {"subject": x["name"], "name": x["name"], "n": x["bench"], "good": True}
+    if x["bench"] <= BB_FLOP:
+        return {"subject": x["name"], "name": x["name"], "n": x["bench"], "good": False}
+    return None
+
+
+def _d_transfer_bad(c, h, s):
+    sw = [(x["name"], mv["ip"] - mv["op"], mv) for x in c for mv in x["moves"]]
+    if not sw:
+        return None
+    name, d, mv = min(sw, key=lambda t: t[1])
+    bar = _bar(s["swings"], 0.06, SWING_BAD, low=True)
+    if d > bar:
+        return None
+    return {"subject": name, "name": name, "out": mv["out"], "op": mv["op"],
+            "in": mv["in"], "ip": mv["ip"], "d": d}
+
+
+def _d_transfer_good(c, h, s):
+    sw = [(x["name"], mv["ip"] - mv["op"], mv) for x in c for mv in x["moves"]]
+    if not sw:
+        return None
+    name, d, mv = max(sw, key=lambda t: t[1])
+    if d < _bar(s["swings"], 0.94, SWING_GOOD):
+        return None
+    return {"subject": name, "name": name, "out": mv["out"], "op": mv["op"],
+            "in": mv["in"], "ip": mv["ip"], "d": d}
+
+
+def _d_bench_pain(c, h, s):
+    pool = [x for x in c if x["chip"] != "bboost"]
+    if not pool:
+        return None
+    x = max(pool, key=lambda y: y["bench"])
+    if x["bench"] < _bar(s["benches"], 0.92, BENCH_PAIN):
+        return None
+    return {"subject": x["name"], "name": x["name"], "n": x["bench"]}
+
+
+def _d_captain_split(c, h, s):
+    tally: dict[str, list] = {}
+    for x in c:
+        if x["cap"]:
+            t = tally.setdefault(x["cap"], [0, x["cap_pts"]])
+            t[0] += 1
+    if len(tally) < 2:
+        return None
+    crowd = max(tally.items(), key=lambda kv: kv[1][0])
+    rest = [kv for kv in tally.items() if kv[0] != crowd[0] and kv[1][0] >= 2]
+    if not rest or crowd[1][1] >= 6:
+        return None
+    alt = max(rest, key=lambda kv: kv[1][1])
+    if alt[1][1] < crowd[1][1] * 2:
+        return None
+    return {"subject": None, "many": crowd[1][0], "big": crowd[0], "bigpts": crowd[1][1],
+            "few": alt[1][0], "small": alt[0], "smallpts": alt[1][1]}
+
+
+def _d_hit_punished(c, h, s):
+    bad = [x for x in c if x["hit"] > 0 and x["pts"] < s["avg"]]
+    if not bad:
+        return None
+    x = min(bad, key=lambda y: y["pts"])
+    return {"subject": x["name"], "name": x["name"], "hit": x["hit"], "pts": x["pts"]}
+
+
+# --- season shape, no fresh fetch needed -------------------------------------
+def _d_chips_left(c, h, s):
+    if len(h) < 3:
+        return None
+    used = {x["name"]: set() for x in c}
+    for gw in h.values():
+        for x in gw:
+            if x["chip"] and x["name"] in used:
+                used[x["name"]].add(x["chip"])
+    clean = [n for n, u in used.items() if not u]
+    if not clean or len(clean) > 6:
+        return None
+    return {"subject": None, "n": len(clean), "who": ", ".join(sorted(clean)[:4])}
+
+
+def _d_cold_streak(c, h, s):
+    runs = _streaks(h, below=True)
+    if not runs:
+        return None
+    name, n = runs[0]
+    return {"subject": name, "name": name, "n": n} if n >= 3 else None
+
+
+def _d_hot_streak(c, h, s):
+    runs = _streaks(h, below=False)
+    if not runs:
+        return None
+    name, n = runs[0]
+    return {"subject": name, "name": name, "n": n} if n >= 3 else None
+
+
+def _d_bench_season(c, h, s):
+    if len(h) < 3:
+        return None
+    tot: dict[str, int] = {}
+    for gw in h.values():
+        for x in gw:
+            if x["chip"] != "bboost":
+                tot[x["name"]] = tot.get(x["name"], 0) + x["bench"]
+    name, n = max(tot.items(), key=lambda kv: kv[1])
+    return {"subject": name, "name": name, "n": n} if n >= 60 else None
+
+
+def _d_captain_season(c, h, s):
+    if len(h) < 3:
+        return None
+    tot: dict[str, int] = {}
+    for gw in h.values():
+        for x in gw:
+            tot[x["name"]] = tot.get(x["name"], 0) + x["cap_pts"] * min(x["cap_mult"], 3)
+    name, n = max(tot.items(), key=lambda kv: kv[1])
+    return {"subject": name, "name": name, "n": n}
+
+
+def _d_volatile(c, h, s):
+    if len(h) < 4:
+        return None
+    rng: dict[str, list] = {}
+    for gw in h.values():
+        for x in gw:
+            rng.setdefault(x["name"], []).append(x["pts"])
+    spread = {n: max(v) - min(v) for n, v in rng.items() if len(v) >= 4}
+    if not spread:
+        return None
+    name, n = max(spread.items(), key=lambda kv: kv[1])
+    return {"subject": name, "name": name, "n": n, "hi": max(rng[name]), "lo": min(rng[name])}
+
+
+def _d_steady(c, h, s):
+    if len(h) < 4:
+        return None
+    rng: dict[str, list] = {}
+    for gw in h.values():
+        for x in gw:
+            rng.setdefault(x["name"], []).append(x["pts"])
+    spread = {n: max(v) - min(v) for n, v in rng.items() if len(v) >= 4}
+    if not spread:
+        return None
+    name, n = min(spread.items(), key=lambda kv: kv[1])
+    return {"subject": name, "name": name, "n": n}
+
+
+def _d_everyone_blanked(c, h, s):
+    if len(h) < 3:
+        return None
+    means = [sum(x["pts"] for x in gw) / len(gw) for gw in h.values()]
+    if s["avg"] > min(means) or len(means) < 3:
+        return None
+    return {"subject": None, "n": round(s["avg"], 1)}
+
+
+# --- phrasings ---------------------------------------------------------------
+# Six ways to say each thing. The one used is picked from the gameweek number,
+# so it varies week to week but is identical on every rebuild of the same week.
+
+PHRASES: dict[str, list[str]] = {
+"turnaround": [
+ "🔄 {name} wooden spoon minggu lepas ({a}), raja minggu ni ({b}).",
+ "🔄 Dari {a} terus ke {b}. {name} bangun dari kubur.",
+ "🔄 {name} paling bawah minggu lepas, paling atas minggu ni. {a} ➜ {b}.",
+ "🔄 Minggu lepas orang gelakkan {name} ({a}). Minggu ni {b}.",
+ "🔄 {name} tukar {a} jadi {b} dalam seminggu. Apa dia makan?",
+ "🔄 Spoon ke mahkota. {name}, {a} ➜ {b}.",
+],
+"chip_flop_solo": [
+ "🃏 {name} TC {player}. {pts} mata. Aduh.",
+ "🃏 {name} pilih {player} untuk Triple Captain. Dia bagi {pts}.",
+ "🃏 Chip paling mahal FPL, dibuang {name} atas {player} ({pts}).",
+ "🃏 {name} TC {player} dapat {pts}. Simpan pun sama.",
+ "🃏 {pts} mata, dikali tiga. {name} tetap rugi.",
+ "🃏 Triple Captain {name} atas {player}: {pts}. Minggu depan cuba lagi.",
+],
+"chip_flop": [
+ "🃏 {n} orang TC {player}. {pts} mata sahaja. {who}.",
+ "🃏 {who} semua TC {player}. Dia bagi {pts}. Sama sama menangis.",
+ "🃏 TC {player} oleh {n} orang. Hasil: {pts} mata. {who}.",
+ "🃏 {who} pakai Triple Captain atas {player}. {pts} mata. Chip hangus.",
+ "🃏 {player} dapat {pts}, dikali tiga oleh {n} orang. {who}.",
+ "🃏 Chip terbaik FPL, dibuang atas {player} ({pts}) oleh {who}.",
+],
+"chip_bang": [
+ "🃏 {name} TC {player} - {pts} x3 = {total}. Power.",
+ "🃏 {total} mata dari satu orang. {name} TC {player}, {pts} jadi {total}.",
+ "🃏 {name} baca game betul betul. TC {player}, {total} mata.",
+ "🃏 Triple Captain {player} oleh {name}. {total} mata. Tak payah cakap apa apa.",
+ "🃏 {name} TC {player} dan dia bagi {pts}. Kali tiga, {total}.",
+ "🃏 Ini baru TC. {name} atas {player}, {total} mata masuk.",
+],
+"bench_boost": [
+ "🃏 Bench Boost {name} tambah {n} mata.",
+ "🃏 {name} buka Bench Boost, {n} mata masuk dari bangku.",
+ "🃏 Bangku {name} bagi {n} mata. Bench Boost berbaloi.",
+ "🃏 {n} mata extra untuk {name}. Bench Boost kena timing.",
+ "🃏 {name} guna Bench Boost. {n} mata percuma.",
+ "🃏 Bench Boost {name}: +{n}. Chip tak membazir.",
+],
+"bench_boost_bad": [
+ "🃏 Bench Boost {name} tambah {n} mata je. Membazir.",
+ "🃏 {name} buang Bench Boost untuk {n} mata. Aduh.",
+ "🃏 {n} mata dari Bench Boost {name}. Chip hilang macam tu je.",
+ "🃏 Bench Boost {name} keluar {n}. Simpan pun sama.",
+ "🃏 {name} pakai Bench Boost minggu salah. {n} mata.",
+ "🃏 Chip Bench Boost {name} bagi {n}. Jangan tanya.",
+],
+"transfer_bad": [
+ "😭 {name} jual {out} ({op}) beli {in} ({ip}). {d}.",
+ "😭 {out} {op} mata. {name} dah jual. Ganti {in} dapat {ip}.",
+ "😭 {name} buang {out} ({op}) ambil {in} ({ip}). Rugi {d}.",
+ "😭 Transfer terbaik minggu ni: {name} lepaskan {out} ({op}) untuk {in} ({ip}).",
+ "😭 {name} tengok {out} score {op} dari bangku orang lain. Dia ada {in}, {ip}.",
+ "😭 {out} ➜ {in}. {op} jadi {ip}. {name} tak nak cakap pasal ni.",
+],
+"transfer_good": [
+ "🎯 {name} buang {out} ({op}) ambil {in} ({ip}). +{d}.",
+ "🎯 {name} baca betul. {out} {op}, {in} {ip}.",
+ "🎯 Transfer bijak: {name} tukar {out} ({op}) ke {in} ({ip}).",
+ "🎯 {name} jual {out} tepat pada masa. {in} bagi {ip}.",
+ "🎯 {in} {ip} mata untuk {name}. {out} yang dibuang? {op}.",
+ "🎯 {name} untung {d} mata dari satu transfer. {out} ➜ {in}.",
+],
+"bench_pain": [
+ "🪑 {name} tinggal {n} mata atas bangku.",
+ "🪑 {n} mata reput atas bangku {name}.",
+ "🪑 Bangku {name} score {n}. Starting XI tak sampai taraf.",
+ "🪑 {name} ada {n} mata yang tak dapat main. Sakit.",
+ "🪑 {n} mata duduk tengok je kat bangku {name}.",
+ "🪑 Kalau bangku {name} boleh main, {n} mata lagi masuk.",
+],
+"captain_split": [
+ "©️ {many} orang captain {big} ({bigpts}). {few} orang {small} ({smallpts}). Tau tau je.",
+ "©️ Ramai ikut {big}, dapat {bigpts}. {few} orang pilih {small}, dapat {smallpts}.",
+ "©️ {big} {bigpts} mata untuk {many} orang. {small} {smallpts} untuk {few} orang.",
+ "©️ Captain crowd {big} ({bigpts}). Yang berani ambil {small} dapat {smallpts}.",
+ "©️ {many} lawan {few}. {big} bagi {bigpts}, {small} bagi {smallpts}.",
+ "©️ Pilihan selamat {big} ({bigpts}) kalah dengan {small} ({smallpts}).",
+],
+"hit_punished": [
+ "💸 {name} ambil -{hit} hit, dapat {pts} je.",
+ "💸 {name} bayar {hit} mata untuk transfer. Hasil akhir {pts}.",
+ "💸 Hit -{hit} oleh {name}. Score {pts}. Tak payah buat pun sama.",
+ "💸 {name} rosakkan minggu sendiri. -{hit} hit, {pts} mata.",
+ "💸 {pts} mata dan masih bayar -{hit}. {name}.",
+ "💸 {name} tak sabar, ambil -{hit}. Dapat {pts}.",
+],
+"chips_left": [
+ "🎴 {n} orang belum sentuh satu chip pun: {who}.",
+ "🎴 Masih simpan semua chip: {who}. Tunggu apa lagi?",
+ "🎴 {who} belum guna chip langsung. Sabar atau lupa?",
+ "🎴 {n} orang ada chip penuh lagi: {who}.",
+ "🎴 Chip masih elok dalam poket {who}.",
+ "🎴 Semua orang dah bakar chip kecuali {who}.",
+],
+"cold_streak": [
+ "🥶 {name} tak lepas average league {n} minggu berturut.",
+ "🥶 {n} minggu {name} bawah average. Bukan nasib dah ni.",
+ "🥶 Dah {n} minggu {name} kalah dengan average.",
+ "🥶 {name} belum atas average sejak {n} minggu lepas.",
+ "🥶 {n} minggu, satu pun tak atas average. {name}.",
+ "🥶 Sejuk betul {name}. {n} minggu bawah paras.",
+],
+"hot_streak": [
+ "🔥 {name} atas average {n} minggu berturut.",
+ "🔥 {n} minggu {name} tak jatuh bawah average.",
+ "🔥 {name} konsisten {n} minggu. Bukan nasib.",
+ "🔥 {n} minggu lepas average untuk {name}. Panas.",
+ "🔥 Tiada minggu buruk untuk {name}. {n} berturut atas average.",
+ "🔥 {name} dah {n} minggu atas average. Orang lain tengok je.",
+],
+"bench_season": [
+ "🪑 Sepanjang musim {name} dah tinggal {n} mata atas bangku.",
+ "🪑 {n} mata. Itu jumlah bangku {name} setakat ni.",
+ "🪑 Kumpul semua bangku {name}: {n} mata hangus.",
+ "🪑 {name} pegang rekod bangku league. {n} mata musim ni.",
+ "🪑 {n} mata tak main untuk {name} musim ni. Satu team penuh.",
+ "🪑 Bangku {name} dah score {n} musim ni. Sayang betul.",
+],
+"captain_season": [
+ "©️ Captain terbaik musim ni: {name}, {n} mata dari armband.",
+ "©️ {name} dapat {n} mata dari captain sahaja. Paling tinggi league.",
+ "©️ Armband {name} bagi {n} mata setakat ni. Nombor satu.",
+ "©️ {n} mata captain untuk {name}. Tiada siapa dekat.",
+ "©️ Kalau ada award captain, {name} ambil. {n} mata.",
+ "©️ {name} pilih captain paling tepat musim ni: {n} mata.",
+],
+"volatile": [
+ "🎢 {name} paling tak stabil. Terbaik {hi}, terburuk {lo}.",
+ "🎢 Beza {n} mata antara minggu terbaik dan terburuk {name}.",
+ "🎢 {name} boleh bagi {hi} atau {lo}. Tiada tengah tengah.",
+ "🎢 Roller coaster {name}: {hi} sampai {lo}.",
+ "🎢 {n} mata jurang dalam musim {name} sendiri.",
+ "🎢 Tak tahu nak jangka {name}. {lo} satu minggu, {hi} minggu lain.",
+],
+"steady": [
+ "📏 {name} paling konsisten. Beza terbaik dan terburuk cuma {n} mata.",
+ "📏 Setiap minggu {name} sama je. Jurang {n} mata sahaja.",
+ "📏 {n} mata beza sepanjang musim untuk {name}. Membosankan, tapi berkesan.",
+ "📏 {name} tak naik tak turun. Range {n} mata.",
+ "📏 Paling stabil league: {name}, {n} mata jurang.",
+ "📏 {name} macam jam. {n} mata beza je.",
+],
+"everyone_blanked": [
+ "📉 Average league {n}. Minggu paling teruk untuk semua orang.",
+ "📉 Semua orang hancur minggu ni. Average {n}.",
+ "📉 {n} average. Bukan korang seorang, memang minggu busuk.",
+ "📉 Average turun ke {n}. Rekod paling rendah musim ni.",
+ "📉 Tiada siapa boleh bangga. Average league {n}.",
+ "📉 League average {n} minggu ni. Semua sama sama sedih.",
+],
+}
+
+# key -> (detector, base novelty, family). Higher novelty means more worth
+# saying when it fires. Only one line per family makes the post, so two
+# transfer stories or two streak lines can never sit next to each other.
+DETECTORS = [
+    ("turnaround",       _d_turnaround,       100, "story"),
+    ("everyone_blanked", _d_everyone_blanked,  95, "league"),
+    ("chip_bang",        _d_chip_bang,         90, "chip"),
+    ("chip_flop",        _d_chip_flop,         88, "chip"),
+    ("bench_boost",      _d_bench_boost,       84, "chip"),
+    ("transfer_bad",     _d_transfer_bad,      80, "transfer"),
+    ("captain_split",    _d_captain_split,     78, "captain"),
+    ("cold_streak",      _d_cold_streak,       74, "streak"),
+    ("hot_streak",       _d_hot_streak,        72, "streak"),
+    ("volatile",         _d_volatile,          70, "shape"),
+    ("bench_pain",       _d_bench_pain,        66, "bench"),
+    ("chips_left",       _d_chips_left,        64, "league"),
+    ("captain_season",   _d_captain_season,    62, "captain"),
+    ("transfer_good",    _d_transfer_good,     60, "transfer"),
+    ("bench_season",     _d_bench_season,      58, "bench"),
+    ("steady",           _d_steady,            54, "shape"),
+    ("hit_punished",     _d_hit_punished,      52, "transfer"),
+]
 
 
 def gw_facts(d: dict, gw: int, final: bool, fetch: bool = True) -> dict | None:
@@ -501,130 +1034,6 @@ def gw_facts(d: dict, gw: int, final: bool, fetch: bool = True) -> dict | None:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(facts, ensure_ascii=False), encoding="utf-8")
     return facts
-
-
-# --- detectors: each returns (priority, subject, line) or None ---------------
-def _turnaround(m, gw, avg):
-    prev = [x for x in m if x["prev"] is not None]
-    if len(prev) < 3:
-        return None
-    bottom = min(x["prev"] for x in prev)
-    top = max(x["pts"] for x in m)
-    who = next((x for x in prev if x["prev"] == bottom and x["pts"] == top), None)
-    if who:
-        return (100, who["name"],
-                f"🔄 {who['name']} wooden spoon minggu lepas ({bottom}), raja minggu ni ({top}).")
-    return None
-
-
-def _chips(m, gw, avg):
-    tc = [x for x in m if x["chip"] == "3xc"]
-    bb = [x for x in m if x["chip"] == "bboost"]
-    flops = [x for x in tc if x["cap_pts"] <= TC_FLOP]
-    if len(flops) >= 2:
-        who = ", ".join(x["name"] for x in flops)
-        return (88, None, f"🃏 {len(flops)} orang TC {flops[0]['cap']}. "
-                          f"{flops[0]['cap_pts']} mata sahaja. {who}.")
-    if flops:
-        x = flops[0]
-        return (85, x["name"], f"🃏 {x['name']} TC {x['cap']} dapat {x['cap_pts']}. Aduh.")
-    bangs = [x for x in tc if x["cap_pts"] >= TC_BANG]
-    if bangs:
-        x = max(bangs, key=lambda y: y["cap_pts"])
-        return (85, x["name"],
-                f"🃏 {x['name']} TC {x['cap']} - {x['cap_pts']} x3 = {x['cap_pts'] * 3}. Power.")
-    if bb:
-        x = max(bb, key=lambda y: y["bench"])
-        if x["bench"] >= BB_BANG:
-            return (85, x["name"], f"🃏 Bench Boost {x['name']} tambah {x['bench']} mata.")
-        if x["bench"] <= BB_FLOP:
-            return (84, x["name"], f"🃏 Bench Boost {x['name']} tambah {x['bench']} mata je. Membazir.")
-    return None
-
-
-def _transfers(m, gw, avg, good: bool):
-    swings = [(x["name"], mv["ip"] - mv["op"], mv) for x in m for mv in x["moves"]]
-    if not swings:
-        return None
-    pick = max(swings, key=lambda s: s[1]) if good else min(swings, key=lambda s: s[1])
-    name, sw, mv = pick
-    if good and sw >= SWING_GOOD:
-        return (60, name, f"🎯 {name} buang {mv['out']} ({mv['op']}) ambil "
-                          f"{mv['in']} ({mv['ip']}). +{sw}.")
-    if not good and sw <= SWING_BAD:
-        return (80, name, f"😭 {name} jual {mv['out']} ({mv['op']}) beli "
-                          f"{mv['in']} ({mv['ip']}). {sw}.")
-    return None
-
-
-def _captain_split(m, gw, avg):
-    tally: dict[str, list] = {}
-    for x in m:
-        if x["cap"]:
-            t = tally.setdefault(x["cap"], [0, x["cap_pts"]])
-            t[0] += 1
-    if len(tally) < 2:
-        return None
-    crowd = max(tally.items(), key=lambda kv: kv[1][0])
-    rest = [kv for kv in tally.items() if kv[0] != crowd[0] and kv[1][0] >= 3]
-    if not rest or crowd[1][1] >= 6:
-        return None
-    alt = max(rest, key=lambda kv: kv[1][1])
-    if alt[1][1] < crowd[1][1] * 2:
-        return None
-    return (70, None, f"©️ {crowd[1][0]} orang captain {crowd[0]} ({crowd[1][1]}). "
-                      f"{alt[1][0]} orang {alt[0]} ({alt[1][1]}). Tau tau je.")
-
-
-def _bench(m, gw, avg):
-    x = max(m, key=lambda y: y["bench"])
-    if x["bench"] < BENCH_PAIN or x["chip"] == "bboost":
-        return None
-    return (65, x["name"], f"🪑 {x['name']} tinggal {x['bench']} mata atas bangku.")
-
-
-def _hit(m, gw, avg):
-    bad = [x for x in m if x["hit"] > 0 and x["pts"] < avg]
-    if not bad:
-        return None
-    x = min(bad, key=lambda y: y["pts"])
-    return (55, x["name"], f"💸 {x['name']} ambil -{x['hit']} hit, dapat {x['pts']} je.")
-
-
-def block_highlights(facts: dict | None, avg: float) -> list[str]:
-    """The best few things that happened, worst news first."""
-    if not facts or not facts.get("managers"):
-        return []
-    m, gw = facts["managers"], facts["gw"]
-    found = [
-        _turnaround(m, gw, avg), _chips(m, gw, avg),
-        _transfers(m, gw, avg, good=False), _captain_split(m, gw, avg),
-        _bench(m, gw, avg), _transfers(m, gw, avg, good=True), _hit(m, gw, avg),
-    ]
-    found = sorted((f for f in found if f), key=lambda f: -f[0])
-
-    lines, used = [], set()
-    for _, subject, text in found:
-        if subject and subject in used:      # never two lines about one manager
-            continue
-        if subject:
-            used.add(subject)
-        lines.append(text)
-        if len(lines) == MAX_HIGHLIGHTS:
-            break
-    return ["", "🔥 *Cerita minggu ni*"] + lines if lines else []
-
-
-def season_marks(facts: dict | None, gw: int) -> tuple[str, str]:
-    """Suffixes for the Raja and wooden spoon lines when a record was set."""
-    if not facts or not facts.get("managers"):
-        return "", ""
-    m = facts["managers"]
-    highs = [x["best"] for x in m if x["best"]]
-    lows = [x["worst"] for x in m if x["worst"]]
-    hi = "  (rekod baru musim ni)" if highs and max(highs)[1] == gw else ""
-    lo = "  (paling teruk musim ni)" if lows and min(lows)[1] == gw else ""
-    return hi, lo
 
 
 # ----------------------------------------------------------------------------
